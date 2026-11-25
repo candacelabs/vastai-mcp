@@ -1,5 +1,6 @@
 """Vast.ai SDK discovery and GPU rental tools over MCP stdio."""
 
+from asyncio import to_thread
 from contextlib import asynccontextmanager, redirect_stdout
 import sys
 from typing import Annotated, Any, Literal
@@ -61,9 +62,9 @@ class VastAuthenticationError(ValueError):
     pass
 
 
-def request(fn, *args, **kwargs):
+async def request(fn, *args, **kwargs):
     try:
-        result = fn(*args, **kwargs)
+        result = await to_thread(fn, *args, **kwargs)
     except HTTPError as exc:
         status = exc.response.status_code if exc.response is not None else "unknown"
         if exc.response is not None:
@@ -118,7 +119,7 @@ def auth_status() -> dict[str, Any]:
 
 
 @mcp.tool(annotations=READ)
-def search_offers(query: str | dict = "", limit: PageSize = 10, order: str = "dph_total",
+async def search_offers(query: str | dict = "", limit: PageSize = 10, order: str = "dph_total",
                   offer_type: Literal["on-demand", "bid", "reserved"] = "on-demand",
                   storage_gb: PositiveAmount = 10) -> list[dict[str, Any]]:
     """Search live, rentable GPU offers. Example: num_gpus=1 gpu_ram>=80 disk_space>=85.
@@ -130,36 +131,36 @@ def search_offers(query: str | dict = "", limit: PageSize = 10, order: str = "dp
     client = public_client()
     params = dict(query=query, offer_type=offer_type, order=parse_order(order), limit=limit, storage=storage_gb)
     try:
-        rows = request(offers.search_offers, client, **params)
+        rows = await request(offers.search_offers, client, **params)
     except VastAuthenticationError:
         if not client.api_key:
             raise
-        rows = request(offers.search_offers, VastClient(), **params)
+        rows = await request(offers.search_offers, VastClient(), **params)
     return [select(row, OFFER_FIELDS) for row in rows]
 
 
 @mcp.tool(annotations=READ)
-def list_instances(limit: PageSize = 25, after_token: str | None = None) -> dict[str, Any]:
+async def list_instances(limit: PageSize = 25, after_token: str | None = None) -> dict[str, Any]:
     """List a page of account instances and return next_token for the following page."""
     params = {"limit": limit, "order_by": [{"col": "id", "dir": "asc"}]}
     if after_token:
         params["after_token"] = after_token
-    data = request(account().show_instances_v1, params)
+    data = await request(account().show_instances_v1, params)
     return {"instances": [select(row, INSTANCE_FIELDS) for row in data["instances"]],
             "next_token": data.get("next_token"), "total_instances": data.get("total_instances")}
 
 
 @mcp.tool(annotations=READ)
-def get_instance(instance_id: PositiveID) -> dict[str, Any]:
+async def get_instance(instance_id: PositiveID) -> dict[str, Any]:
     """Get instance state, GPU, price, SSH address and exposed ports by contract ID."""
-    row = request(account().show_instance, instance_id)
+    row = await request(account().show_instance, instance_id)
     if row is None:
         raise ValueError(f"Vast.ai found no instance with ID {instance_id}")
     return select(row, INSTANCE_FIELDS)
 
 
 @mcp.tool(annotations=CREATE)
-def create_instance(offer_id: PositiveID, disk_gb: PositiveAmount, image: str | None = None,
+async def create_instance(offer_id: PositiveID, disk_gb: PositiveAmount, image: str | None = None,
                     template_hash: str | None = None, env: str | dict | None = None,
                     onstart_cmd: str | None = None, label: str | None = None, ssh: bool = False,
                     direct: bool = False, jupyter: bool = False, bid_price: PositiveAmount | None = None) -> dict[str, Any]:
@@ -169,40 +170,40 @@ def create_instance(offer_id: PositiveID, disk_gb: PositiveAmount, image: str | 
     """
     if not (image or template_hash):
         raise ValueError("Supply image or template_hash.")
-    return request(account(write=True).create_instance, offer_id, image=image, template_hash=template_hash,
+    return await request(account(write=True).create_instance, offer_id, image=image, template_hash=template_hash,
                    disk=disk_gb, env=env, onstart_cmd=onstart_cmd, label=label, ssh=ssh, direct=direct,
                    jupyter=jupyter, bid_price=bid_price)
 
 
 @mcp.tool(annotations=CHANGE)
-def start_instance(instance_id: PositiveID) -> dict[str, Any]:
+async def start_instance(instance_id: PositiveID) -> dict[str, Any]:
     """Start a stopped instance and resume GPU billing."""
-    return request(account(write=True).start_instance, instance_id)
+    return await request(account(write=True).start_instance, instance_id)
 
 
 @mcp.tool(annotations=CHANGE)
-def stop_instance(instance_id: PositiveID) -> dict[str, Any]:
+async def stop_instance(instance_id: PositiveID) -> dict[str, Any]:
     """Stop an instance. Persistent storage remains billable."""
-    return request(account(write=True).stop_instance, instance_id)
+    return await request(account(write=True).stop_instance, instance_id)
 
 
 @mcp.tool(annotations=CHANGE)
-def destroy_instance(instance_id: PositiveID) -> dict[str, Any]:
+async def destroy_instance(instance_id: PositiveID) -> dict[str, Any]:
     """Destroy the specified rental and its instance-local data."""
-    return request(account(write=True).destroy_instance, instance_id)
+    return await request(account(write=True).destroy_instance, instance_id)
 
 
 @mcp.tool(annotations=READ)
-def instance_logs(instance_id: PositiveID, tail: Annotated[int, Field(ge=1, le=1000)] = 100,
+async def instance_logs(instance_id: PositiveID, tail: Annotated[int, Field(ge=1, le=1000)] = 100,
                   filter: str | None = None, daemon_logs: bool = False) -> dict[str, Any]:
     """Get the last lines of workload or daemon logs from the specified rental."""
-    return {"logs": request(account().logs, instance_id, tail=str(tail), filter=filter, daemon_logs=daemon_logs)}
+    return {"logs": await request(account().logs, instance_id, tail=str(tail), filter=filter, daemon_logs=daemon_logs)}
 
 
 @mcp.tool(annotations=READ)
-def list_endpoints() -> list[dict[str, Any]]:
+async def list_endpoints() -> list[dict[str, Any]]:
     """List account serverless endpoint groups and their capacity settings."""
-    rows = request(account().show_endpoints)
+    rows = await request(account().show_endpoints)
     fields = ("id", "endptjob_id", "endpoint_name", "endpoint_state", "url", "min_load",
               "target_util", "cold_workers", "max_workers", "created_at")
     return [select(row, fields) for row in rows]

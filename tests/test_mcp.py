@@ -1,12 +1,12 @@
-from functools import wraps
+import asyncio
 import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import sys
 import threading
-import unittest
 from urllib.parse import parse_qs, urlsplit
 
+import pytest
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
@@ -31,6 +31,8 @@ class Fixture(BaseHTTPRequestHandler):
         elif url.path == "/api/v0/asks/31/":
             data = {"success": True, "new_contract": 47}
         elif url.path == "/api/v1/instances/":
+            self.server.listing_started.set()
+            self.server.allow_listing.wait(timeout=8)
             data = {"instances": [row], "next_token": "page-3", "total_instances": 7}
         elif url.path == "/api/v0/instances/47/":
             data = {"instances": row} if self.command == "GET" else {"success": True}
@@ -55,100 +57,125 @@ class Fixture(BaseHTTPRequestHandler):
     do_GET = do_POST = do_PUT = do_DELETE = handle_request
 
 
-def with_mcp(test):
-    @wraps(test)
-    async def run(self):
-        params = StdioServerParameters(
-            command=str(Path(sys.executable).with_name("vastai-mcp")),
-            env={"VAST_URL": f"http://127.0.0.1:{self.api.server_port}", "VAST_API_KEY": "test-fixture"},
-        )
-        async with stdio_client(params) as (read, write), ClientSession(read, write) as session:
-            self.session = session
-            await session.initialize()
-            await test(self)
-    return run
+pytestmark = pytest.mark.anyio
 
 
-class VastMcpTests(unittest.IsolatedAsyncioTestCase):
-    def setUp(self):
-        self.api = ThreadingHTTPServer(("127.0.0.1", 0), Fixture)
-        self.api.calls = []
-        self.api.reject_key = False
-        thread = threading.Thread(target=self.api.serve_forever, kwargs={"poll_interval": 0.02}, daemon=True)
+@pytest.fixture
+def anyio_backend():
+    return "asyncio"
+
+
+@pytest.fixture
+def api():
+    with ThreadingHTTPServer(("127.0.0.1", 0), Fixture) as server:
+        server.calls = []
+        server.reject_key = False
+        server.listing_started = threading.Event()
+        server.allow_listing = threading.Event()
+        server.allow_listing.set()
+        thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.02}, daemon=True)
         thread.start()
-        self.addCleanup(self.api.server_close)
-        self.addCleanup(thread.join)
-        self.addCleanup(self.api.shutdown)
+        try:
+            yield server
+        finally:
+            server.allow_listing.set()
+            server.shutdown()
+            thread.join()
 
-    async def call(self, name, **arguments):
-        result = await self.session.call_tool(name, arguments)
-        self.assertFalse(result.isError, result.content)
-        return result.structuredContent
 
-    @with_mcp
-    async def test_discovery_and_offer_search(self):
-        tools = await self.session.list_tools()
-        self.assertEqual(len(tools.tools), 12)
-        meta = await self.session.read_resource("vastai://sdk")
-        self.assertEqual(json.loads(meta.contents[0].text)["symbols"], 557)
-        hits = await self.call("sdk_search", query="creat instnce", limit=1)
-        self.assertEqual(hits["result"][0]["name"], "vastai.sdk.VastAI.create_instance")
-        item = await self.call("sdk_describe", symbol="vastai.VastAI.create_instance")
-        self.assertIn("onstart_cmd", item["signature"])
-        self.assertIn(item["revision"], item["source"])
-        self.assertTrue((await self.call("auth_status"))["configured"])
-        self.assertEqual(self.api.calls, [])
-        offers = await self.call("search_offers", query="gpu_ram>=80 disk_space>=85", storage_gb=85)
-        self.assertEqual(offers["result"][0]["id"], 31)
-        method, path, _, body = self.api.calls[-1]
-        self.assertEqual((method, path), ("POST", "/api/v0/bundles/"))
-        self.assertEqual(body["gpu_ram"], {"gte": 80000})
-        self.assertEqual(body["allocated_storage"], 85)
+@pytest.fixture
+async def session(api):
+    params = StdioServerParameters(
+        command=str(Path(sys.executable).with_name("vastai-mcp")),
+        env={"VAST_URL": f"http://127.0.0.1:{api.server_port}", "VAST_API_KEY": "test-fixture"},
+    )
+    async with stdio_client(params) as (read, write), ClientSession(read, write) as client:
+        await client.initialize()
+        yield client
 
-    @with_mcp
-    async def test_lifecycle_on_loopback(self):
-        startup = 'export HF_TOKEN="${HF_TOKEN:-1}"\nentrypoint.sh &\nwait'
-        created = await self.call("create_instance", offer_id=31, disk_gb=85, image="vastai/vllm:fixture",
-                                  env='-p 3000:3000 -e MODEL_NAME="org/model"', onstart_cmd=startup,
-                                  label="gpu-test", ssh=True, direct=True)
-        self.assertEqual(created["new_contract"], 47)
-        method, path, _, body = self.api.calls[-1]
-        self.assertEqual((method, path), ("PUT", "/api/v0/asks/31/"))
-        self.assertEqual((body["disk"], body["image"], body["label"]), (85, "vastai/vllm:fixture", "gpu-test"))
-        self.assertEqual(body["env"], {"-p 3000:3000": "1", "MODEL_NAME": "org/model"})
-        self.assertEqual(body["onstart"], startup)
-        self.assertEqual(body["runtype"], "ssh_direc ssh_proxy")
-        page = await self.call("list_instances", limit=2, after_token="page-2")
-        self.assertEqual(page["next_token"], "page-3")
-        self.assertEqual(self.api.calls[-1][2]["after_token"], ["page-2"])
-        self.assertNotIn("extra_env", page["instances"][0])
-        instance = await self.call("get_instance", instance_id=47)
-        self.assertEqual(instance["actual_status"], "running")
-        self.assertNotIn("extra_env", instance)
-        logs = await self.call("instance_logs", instance_id=47, tail=3)
-        self.assertEqual(logs["logs"], "worker ready\n")
-        endpoints = await self.call("list_endpoints")
-        self.assertEqual(endpoints["result"], [{"id": 56, "endpoint_name": "gpu"}])
-        for tool, state in [("stop_instance", "stopped"), ("start_instance", "running")]:
-            await self.call(tool, instance_id=47)
-            self.assertEqual(self.api.calls[-1], ("PUT", "/api/v0/instances/47/", {}, {"state": state}))
-        await self.call("destroy_instance", instance_id=47)
-        self.assertEqual(self.api.calls[-1][:2], ("DELETE", "/api/v0/instances/47/"))
 
-    @with_mcp
-    async def test_rejected_credentials_allow_public_offers(self):
-        self.api.reject_key = True
-        offers = await self.call("search_offers", limit=1)
-        self.assertEqual(offers["result"][0]["id"], 31)
-        self.assertEqual([c[1] for c in self.api.calls], ["/api/v0/bundles/"] * 2)
-        listing = await self.session.call_tool("list_instances", {"limit": 1})
-        self.assertTrue(listing.isError)
-        self.assertIn("auth_error", listing.content[0].text)
-        self.assertEqual(len(self.api.calls), 3)
+async def call(session, tool, **arguments):
+    result = await session.call_tool(tool, arguments)
+    assert not result.isError, result.content
+    return result.structuredContent
 
-    @with_mcp
-    async def test_rental_failure_is_reported_without_retry(self):
-        result = await self.session.call_tool("create_instance", {"offer_id": 999, "disk_gb": 85, "image": "example"})
-        self.assertTrue(result.isError)
-        self.assertIn("HTTP 503", result.content[0].text)
-        self.assertEqual(len(self.api.calls), 1)
+
+async def test_discovery_and_offer_search(session, api):
+    tools = await session.list_tools()
+    assert len(tools.tools) == 12
+    meta = await session.read_resource("vastai://sdk")
+    assert json.loads(meta.contents[0].text)["symbols"] == 557
+    hits = await call(session, "sdk_search", query="creat instnce", limit=1)
+    assert hits["result"][0]["name"] == "vastai.sdk.VastAI.create_instance"
+    item = await call(session, "sdk_describe", symbol="vastai.VastAI.create_instance")
+    assert "onstart_cmd" in item["signature"]
+    assert item["revision"] in item["source"]
+    assert (await call(session, "auth_status"))["configured"]
+    assert api.calls == []
+    offers = await call(session, "search_offers", query="gpu_ram>=80 disk_space>=85", storage_gb=85)
+    assert offers["result"][0]["id"] == 31
+    method, path, _, body = api.calls[-1]
+    assert (method, path) == ("POST", "/api/v0/bundles/")
+    assert body["gpu_ram"] == {"gte": 80000}
+    assert body["allocated_storage"] == 85
+
+
+async def test_sdk_lookup_during_pending_http_request(session, api):
+    api.allow_listing.clear()
+    listing = asyncio.create_task(call(session, "list_instances"))
+    try:
+        assert await asyncio.to_thread(api.listing_started.wait, 4)
+        lookup = await asyncio.wait_for(call(session, "sdk_describe", symbol="VastAI.create_instance"), 3)
+        assert "onstart_cmd" in lookup["signature"]
+        assert not listing.done()
+    finally:
+        api.allow_listing.set()
+        await listing
+
+
+async def test_lifecycle_on_loopback(session, api):
+    startup = 'export HF_TOKEN="${HF_TOKEN:-1}"\nentrypoint.sh &\nwait'
+    created = await call(session, "create_instance", offer_id=31, disk_gb=85, image="vastai/vllm:fixture",
+                         env='-p 3000:3000 -e MODEL_NAME="org/model"', onstart_cmd=startup,
+                         label="gpu-test", ssh=True, direct=True)
+    assert created["new_contract"] == 47
+    method, path, _, body = api.calls[-1]
+    assert (method, path) == ("PUT", "/api/v0/asks/31/")
+    assert (body["disk"], body["image"], body["label"]) == (85, "vastai/vllm:fixture", "gpu-test")
+    assert body["env"] == {"-p 3000:3000": "1", "MODEL_NAME": "org/model"}
+    assert body["onstart"] == startup
+    assert body["runtype"] == "ssh_direc ssh_proxy"
+    page = await call(session, "list_instances", limit=2, after_token="page-2")
+    assert page["next_token"] == "page-3"
+    assert api.calls[-1][2]["after_token"] == ["page-2"]
+    assert "extra_env" not in page["instances"][0]
+    instance = await call(session, "get_instance", instance_id=47)
+    assert instance["actual_status"] == "running"
+    assert "extra_env" not in instance
+    logs = await call(session, "instance_logs", instance_id=47, tail=3)
+    assert logs["logs"] == "worker ready\n"
+    endpoints = await call(session, "list_endpoints")
+    assert endpoints["result"] == [{"id": 56, "endpoint_name": "gpu"}]
+    for tool, state in [("stop_instance", "stopped"), ("start_instance", "running")]:
+        await call(session, tool, instance_id=47)
+        assert api.calls[-1] == ("PUT", "/api/v0/instances/47/", {}, {"state": state})
+    await call(session, "destroy_instance", instance_id=47)
+    assert api.calls[-1][:2] == ("DELETE", "/api/v0/instances/47/")
+
+
+async def test_rejected_credentials_allow_public_offers(session, api):
+    api.reject_key = True
+    offers = await call(session, "search_offers", limit=1)
+    assert offers["result"][0]["id"] == 31
+    assert [c[1] for c in api.calls] == ["/api/v0/bundles/"] * 2
+    listing = await session.call_tool("list_instances", {"limit": 1})
+    assert listing.isError
+    assert "auth_error" in listing.content[0].text
+    assert len(api.calls) == 3
+
+
+async def test_rental_failure_is_reported_without_retry(session, api):
+    result = await session.call_tool("create_instance", {"offer_id": 999, "disk_gb": 85, "image": "example"})
+    assert result.isError
+    assert "HTTP 503" in result.content[0].text
+    assert len(api.calls) == 1

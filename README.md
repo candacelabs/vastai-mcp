@@ -4,10 +4,12 @@ Search the Vast.ai Python SDK offline, compare live GPU offers, and manage GPU r
 
 ## Set up
 
-Run these commands from this checkout with Python 3.11 or later and `uv`.
+Install the tagged release in a dedicated checkout with Git, `uv`, and the Codex CLI. These commands install the locked dependencies and register a local stdio executable.
 
 ```bash
-uv sync --locked
+git clone --branch v0.1.0 --depth 1 https://github.com/candacelabs/vastai-mcp.git
+cd vastai-mcp
+uv sync --locked --no-editable --python 3.12
 codex mcp add vastai -- "$(pwd)/.venv/bin/vastai-mcp"
 codex mcp get vastai
 ```
@@ -52,7 +54,13 @@ To rebuild the index from the maintained repository and run the protocol tests, 
 ```bash
 git clone https://github.com/vast-ai/vast-cli ../vast-cli  # if absent
 uv run --locked python scripts/index_sdk.py ../vast-cli
-uv run --locked python -m unittest discover -s tests -v
+uv run --locked --group test pytest -q
 ```
 
 The indexer reads the Git tag pinned by `pyproject.toml`, currently [v1.12.0](https://github.com/vast-ai/vast-cli/tree/50c16ea5bdad0605baf57167f18b7b6a93ed661d).
+
+## Releases
+
+CI builds the source distribution and wheel, installs the wheel against the locked dependencies, and runs the stdio tests on Python 3.11 through 3.14. It also checks that the committed SDK index matches upstream. To cut a release, update the package version and installation example, refresh `uv.lock`, and push the matching `vX.Y.Z` tag on the tested commit. The tag workflow publishes the wheel, source distribution, and `SHA256SUMS` to [GitHub Releases](https://github.com/candacelabs/vastai-mcp/releases).
+
+For a failed or timed-out rental request, check `list_instances` before issuing another `create_instance`. The server sends each write once, and Vast may have accepted the request before the connection failed.

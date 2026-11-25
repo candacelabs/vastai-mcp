@@ -1,0 +1,74 @@
+name: Test and release
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      matrix:
+        python: ["3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
+        with:
+          version: "0.13.5"
+          python-version: ${{ matrix.python }}
+      - name: Install locked runtime dependencies
+        run: uv sync --locked --group test --no-install-project
+      - name: Rebuild the SDK index
+        if: matrix.python == '3.12'
+        run: |
+          sdk_tag=$(.venv/bin/python -c 'import json; print("v" + json.load(open("src/vastai_mcp/sdk-index.json"))["version"])')
+          git clone --quiet --depth 1 --branch "$sdk_tag" https://github.com/vast-ai/vast-cli "$RUNNER_TEMP/vast-cli"
+          .venv/bin/python scripts/index_sdk.py "$RUNNER_TEMP/vast-cli"
+          git diff --exit-code -- src/vastai_mcp/sdk-index.json
+      - name: Build and test the wheel
+        run: |
+          uv build --no-sources
+          uv pip install --python .venv/bin/python --no-deps dist/*.whl
+          .venv/bin/python -m pytest -q
+      - name: Prepare versioned release assets
+        if: startsWith(github.ref, 'refs/tags/') && matrix.python == '3.12'
+        run: |
+          version=$(.venv/bin/python -c 'from importlib.metadata import version; print(version("vastai-mcp"))')
+          test "$GITHUB_REF_NAME" = "v$version"
+          cd dist
+          sha256sum *.whl *.tar.gz > SHA256SUMS
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: startsWith(github.ref, 'refs/tags/') && matrix.python == '3.12'
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: test
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: dist
+          path: dist
+      - name: Publish tested distributions
+        env:
+          GH_TOKEN: ${{ github.token }}
+        working-directory: dist
+        run: |
+          sha256sum --check SHA256SUMS
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag \
+            --title "$GITHUB_REF_NAME" --generate-notes *.whl *.tar.gz SHA256SUMS

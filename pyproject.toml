@@ -6,11 +6,15 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = ["mcp>=1.24,<2", "vastai==1.12.0"]
 
+[project.urls]
+Repository = "https://github.com/candacelabs/vastai-mcp"
+Issues = "https://github.com/candacelabs/vastai-mcp/issues"
+
 [project.scripts]
 vastai-mcp = "vastai_mcp.server:main"
 
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling==1.33.0"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
@@ -18,3 +22,8 @@ packages = ["src/vastai_mcp"]
 
 [tool.hatch.build.targets.wheel.force-include]
 "VAST-LICENSE.txt" = "vastai_mcp/VAST-LICENSE.txt"
+
+[dependency-groups]
+test = [
+    "pytest>=8,<10",
+]
