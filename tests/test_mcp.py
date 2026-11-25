@@ -1,14 +1,22 @@
 import asyncio
+from contextlib import asynccontextmanager
 import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import os
 from pathlib import Path
+import re
 import sys
 import threading
 from urllib.parse import parse_qs, urlsplit
 
+import httpx
 import pytest
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
+from mcp.client.streamable_http import streamable_http_client
+
+
+EXECUTABLE = str(Path(sys.executable).with_name("vastai-mcp"))
 
 
 class Fixture(BaseHTTPRequestHandler):
@@ -84,14 +92,57 @@ def api():
 
 
 @pytest.fixture
-async def session(api):
-    params = StdioServerParameters(
-        command=str(Path(sys.executable).with_name("vastai-mcp")),
-        env={"VAST_URL": f"http://127.0.0.1:{api.server_port}", "VAST_API_KEY": "test-fixture"},
+def vast_env(api):
+    return {"VAST_URL": f"http://127.0.0.1:{api.server_port}", "VAST_API_KEY": "test-fixture"}
+
+
+@asynccontextmanager
+async def http_host(env):
+    process = await asyncio.create_subprocess_exec(
+        EXECUTABLE, "--http", "--port", "0", env={**os.environ, **env, "VASTAI_MCP_TOKEN": "client-fixture"},
+        stderr=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.DEVNULL,
     )
-    async with stdio_client(params) as (read, write), ClientSession(read, write) as client:
+    try:
+        async with asyncio.timeout(15):
+            while line := await process.stderr.readline():
+                address = re.search(rb"Uvicorn running on (http://127\.0\.0\.1:\d+)", line)
+                if address:
+                    break
+            else:
+                raise RuntimeError("HTTP server exited before accepting connections")
+        yield address[1].decode()
+    finally:
+        if process.returncode is None:
+            process.terminate()
+        await asyncio.wait_for(process.wait(), 10)
+
+
+@pytest.fixture(params=["stdio", "http"])
+async def session(request, vast_env):
+    if request.param == "stdio":
+        params = StdioServerParameters(command=EXECUTABLE, env=vast_env)
+        async with stdio_client(params) as (read, write), ClientSession(read, write) as client:
+            await client.initialize()
+            yield client
+        return
+    async with (
+        http_host(vast_env) as url,
+        httpx.AsyncClient(headers={"Authorization": "Bearer client-fixture"}) as http,
+        streamable_http_client(url + "/mcp", http_client=http) as (read, write, _),
+        ClientSession(read, write) as client,
+    ):
         await client.initialize()
         yield client
+
+
+async def test_http_health_and_authentication(vast_env, api):
+    async with http_host(vast_env) as url, httpx.AsyncClient(base_url=url) as client:
+        assert (await client.get("/healthz")).json() == {"status": "ok"}
+        for headers in [{}, {"Authorization": "Bearer wrong"}]:
+            response = await client.post("/mcp", headers=headers, json={})
+            assert response.status_code == 401
+            assert response.headers["www-authenticate"] == "Bearer"
+        assert api.calls == []
 
 
 async def call(session, tool, **arguments):

@@ -1,13 +1,13 @@
 # Vast.ai MCP for Codex
 
-Search the Vast.ai Python SDK offline, compare live GPU offers, and manage GPU rentals from Codex. This stdio server starts when Codex connects. It uses the Python SDK maintained in [vast-ai/vast-cli](https://github.com/vast-ai/vast-cli).
+Search the Vast.ai Python SDK offline, compare live GPU offers, and manage GPU rentals from Codex. Codex can launch the server over stdio or connect to its FastAPI endpoint over Streamable HTTP. Both expose the same tools and use the Python SDK maintained in [vast-ai/vast-cli](https://github.com/vast-ai/vast-cli).
 
 ## Set up
 
 Install the tagged release in a dedicated checkout with Git, `uv`, and the Codex CLI. These commands install the locked dependencies and register a local stdio executable.
 
 ```bash
-git clone --branch v0.1.0 --depth 1 https://github.com/candacelabs/vastai-mcp.git
+git clone --branch v0.2.0 --depth 1 https://github.com/candacelabs/vastai-mcp.git
 cd vastai-mcp
 uv sync --locked --no-editable --python 3.12
 codex mcp add vastai -- "$(pwd)/.venv/bin/vastai-mcp"
@@ -21,6 +21,21 @@ env_vars = ["VAST_API_KEY", "XDG_CONFIG_HOME"]
 ```
 
 The SDK also reads its CLI credential file at `$XDG_CONFIG_HOME/vastai/vast_api_key`, normally `~/.config/vastai/vast_api_key`. SDK lookup and public offer searches work without credentials. Public offer search also retries anonymously if Vast rejects the configured key. Ask Codex to call `auth_status` to check local key discovery or `list_instances` to check live account access.
+
+### FastAPI over HTTP
+
+To share one foreground MCP process with local clients, set `VASTAI_MCP_TOKEN` to a private random value in the environments of both the server and Codex. This token authenticates MCP clients. The server uses its own `VAST_API_KEY` to call Vast. Launch the server from the release checkout.
+
+```bash
+.venv/bin/vastai-mcp --http --port 8765
+```
+
+From the client shell, register the endpoint and start Codex. The server listens on loopback. `GET /healthz` checks readiness, and `/mcp` accepts authenticated MCP requests. Ctrl-C in the server terminal shuts it down.
+
+```bash
+curl --fail http://127.0.0.1:8765/healthz
+codex mcp add vastai-http --url http://127.0.0.1:8765/mcp --bearer-token-env-var VASTAI_MCP_TOKEN
+```
 
 ## Use the tools
 
@@ -61,6 +76,6 @@ The indexer reads the Git tag pinned by `pyproject.toml`, currently [v1.12.0](ht
 
 ## Releases
 
-CI builds the source distribution and wheel, installs the wheel against the locked dependencies, and runs the stdio tests on Python 3.11 through 3.14. It also checks that the committed SDK index matches upstream. To cut a release, update the package version and installation example, refresh `uv.lock`, and push the matching `vX.Y.Z` tag on the tested commit. The tag workflow publishes the wheel, source distribution, and `SHA256SUMS` to [GitHub Releases](https://github.com/candacelabs/vastai-mcp/releases).
+CI builds the source distribution and wheel, installs the wheel against the locked dependencies, and runs pytest over both transports on Python 3.11 through 3.14. It also checks that the committed SDK index matches upstream. To cut a release, update the package version and installation example, refresh `uv.lock`, and push the matching `vX.Y.Z` tag on the tested commit. The tag workflow publishes the wheel, source distribution, and `SHA256SUMS` to [GitHub Releases](https://github.com/candacelabs/vastai-mcp/releases).
 
 For a failed or timed-out rental request, check `list_instances` before issuing another `create_instance`. The server sends each write once, and Vast may have accepted the request before the connection failed.

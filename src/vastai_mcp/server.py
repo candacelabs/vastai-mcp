@@ -1,7 +1,9 @@
-"""Vast.ai SDK discovery and GPU rental tools over MCP stdio."""
+"""Vast.ai SDK discovery and GPU rental tools over MCP."""
 
+import argparse
 from asyncio import to_thread
-from contextlib import asynccontextmanager, redirect_stdout
+from contextlib import asynccontextmanager, nullcontext, redirect_stdout
+from contextvars import ContextVar
 import sys
 from typing import Annotated, Any, Literal
 
@@ -17,14 +19,18 @@ from vastai.api.query import offers_alias, offers_fields, offers_mult, parse_ord
 from . import catalog
 
 
+_stdio = ContextVar("vastai_stdio", default=False)
+
+
 @asynccontextmanager
 async def sdk_diagnostics(_server):
-    # MCP has captured its stdio transport. Route subsequent SDK prints away from the protocol.
-    with redirect_stdout(sys.stderr):
+    # The SDK can print diagnostics. Reserve stdout for protocol messages in stdio mode.
+    with redirect_stdout(sys.stderr) if _stdio.get() else nullcontext():
         yield
 
 
-mcp = FastMCP("vastai", lifespan=sdk_diagnostics, log_level="WARNING", instructions=(
+mcp = FastMCP("vastai", lifespan=sdk_diagnostics, stateless_http=True, json_response=True,
+              log_level="WARNING", instructions=(
     "Search the SDK locally with sdk_search and sdk_describe. search_offers reads current GPU prices. "
     "create_instance rents the specified offer. stop_instance retains storage and destroy_instance releases it."
 ))
@@ -210,4 +216,26 @@ async def list_endpoints() -> list[dict[str, Any]]:
 
 
 def main():
-    mcp.run(transport="stdio")
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--http", action="store_true", help="Serve /mcp with FastAPI on 127.0.0.1")
+    parser.add_argument("--port", type=int, help="Local HTTP port (default 8765)")
+    args = parser.parse_args()
+    if args.http:
+        import os
+        import uvicorn
+        from .http import create_app
+
+        token = os.environ.get("VASTAI_MCP_TOKEN")
+        if not token:
+            parser.error("--http requires VASTAI_MCP_TOKEN for incoming requests")
+        if args.port is not None and not 0 <= args.port <= 65535:
+            parser.error("--port must be between 0 and 65535")
+        uvicorn.run(create_app(mcp, token), host="127.0.0.1", port=8765 if args.port is None else args.port)
+    else:
+        if args.port is not None:
+            parser.error("--port requires --http")
+        token = _stdio.set(True)
+        try:
+            mcp.run(transport="stdio")
+        finally:
+            _stdio.reset(token)
